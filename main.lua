@@ -50,6 +50,12 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Upload now"),
+                callback = function()
+                    self:doUpload()
+                end,
+            },
+            {
                 text = _("WebDAV server"),
                 keep_menu_open = true,
                 callback = function()
@@ -299,6 +305,68 @@ function WebDAVSync:doSync(is_auto, turn_off_wifi)
         if NetworkMgr and NetworkMgr.turnOffWifi then
             NetworkMgr:turnOffWifi()
         end
+    end
+end
+
+function WebDAVSync:doUpload()
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
+        UIManager:show(ConfirmBox:new{
+            text = _("WiFi is not enabled. Turn on WiFi now?"),
+            ok_text = _("Turn on WiFi"),
+            ok_callback = function()
+                NetworkMgr:turnOnWifi(function()
+                    self:doUpload()
+                end)
+            end,
+        })
+        return
+    end
+    local server_url = self:getSetting("server_url", "")
+    if type(server_url) == "string" then
+        server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
+    else
+        server_url = ""
+    end
+    local username = self:getSetting("username", "")
+    local password = self:getSetting("password", "")
+    local folder = self:getSetting("download_folder", "")
+    local file_extensions = self:getSetting("file_extensions", "")
+    if not folder or folder == "" then
+        UIManager:show(ConfirmBox:new{
+            text = _("Download folder not set. Choose folder now?"),
+            ok_text = _("Choose folder"),
+            ok_callback = function()
+                self:setDownloadFolder()
+            end,
+        })
+        return
+    end
+    if not server_url or server_url == "" then
+        UIManager:show(ConfirmBox:new{
+            text = _("WebDAV server not set. Set it now?"),
+            ok_text = _("WebDAV server"),
+            ok_callback = function()
+                self:setWebDAVServer()
+            end,
+        })
+        return
+    end
+    local uploading_msg = InfoMessage:new{ text = _("Uploading…") }
+    UIManager:show(uploading_msg)
+    UIManager:forceRePaint()
+    local ok, skip, err = sync.run_upload(server_url, username, password, folder, nil, file_extensions)
+    UIManager:close(uploading_msg)
+    if err then
+        UIManager:show(InfoMessage:new{
+            text = T(_("Upload failed: %1"), tostring(err)),
+        })
+    else
+        local msg = T(_("Upload done. Uploaded %1 file(s)."), tostring(ok))
+        if (tonumber(skip) or 0) > 0 then
+            msg = msg .. " " .. T(_("%1 skipped (already exists)."), tostring(skip))
+        end
+        UIManager:show(InfoMessage:new{ text = msg })
     end
 end
 

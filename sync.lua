@@ -4,6 +4,9 @@ Sync logic: list all files from WebDAV and download to local folder.
 
 local webdav = require("webdav")
 local epub_metadata = require("epub_metadata")
+local logger = require("logger")
+
+local LOG = "[webdav-autosync] "
 
 
 --- File extensions KOReader supports (default when user leaves filter empty).
@@ -72,10 +75,13 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
         return 0, 0, "Download folder is not set"
     end
     local_folder = local_folder:gsub("/+$", "")
+    logger.info(LOG .. "run_sync: url=" .. server_url .. " folder=" .. local_folder)
     local list, code, err = webdav.list_all(server_url, username, password)
     if not list then
+        logger.err(LOG .. "run_sync: list_all failed code=" .. tostring(code) .. " err=" .. tostring(err))
         return 0, 0, "List failed: " .. tostring(code) .. " " .. tostring(err)
     end
+    logger.info(LOG .. "run_sync: listed " .. #list .. " remote entries")
     local base = base_path_from_url(server_url)
     local extensions_set = parse_extensions(extensions_filter)
     local files = {}
@@ -148,6 +154,7 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
             end
         end
     end
+    logger.info(LOG .. "run_sync done: downloaded=" .. count_ok .. " skipped=" .. count_skipped .. " failed=" .. count_fail)
     if (tonumber(count_fail) or 0) > 0 then
         local error_msg = tostring(count_fail) .. " file(s) failed:\n" .. table.concat(failed_files, "\n")
         return count_ok, count_fail, error_msg
@@ -155,7 +162,139 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
     return count_ok, count_skipped, nil
 end
 
+--- Recursively scan local_folder for files matching extensions_set.
+--- Returns a list of relative paths (e.g. "subdir/book.epub"), or nil, err.
+local function scan_local_files(folder, extensions_set)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
+    if not ok_lfs or not lfs then
+        logger.err(LOG .. "scan_local_files: lfs not available")
+        return nil, "lfs not available"
+    end
+    logger.dbg(LOG .. "scan_local_files: scanning " .. tostring(folder))
+    local files = {}
+    local function scan(dir, prefix)
+        local ok_iter, iter, state = pcall(lfs.dir, dir)
+        if not ok_iter or not iter then
+            logger.warn(LOG .. "scan_local_files: cannot open dir " .. tostring(dir) .. " iter=" .. tostring(iter) .. " ok=" .. tostring(ok_iter))
+            return
+        end
+        for entry in iter, state do
+            if entry ~= "." and entry ~= ".." then
+                local full = dir .. "/" .. entry
+                local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+                local attr = lfs.attributes(full)
+                if attr then
+                    if attr.mode == "directory" then
+                        scan(full, rel)
+                    elseif attr.mode == "file" and extension_allowed(entry, extensions_set) then
+                        table.insert(files, rel)
+                    end
+                end
+            end
+        end
+    end
+    scan(folder, "")
+    logger.info(LOG .. "scan_local_files: found " .. #files .. " files in " .. tostring(folder))
+    return files
+end
+
+--- Upload local files to WebDAV. Skips files already present on the server.
+--- Returns: count_uploaded, count_skipped, error_message (nil on success).
+function run_upload(server_url, username, password, local_folder, progress_cb, extensions_filter)
+    if not server_url or type(server_url) ~= "string" then
+        return 0, 0, "Server URL is not set"
+    end
+    server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
+    if server_url == "" then
+        return 0, 0, "Server URL is not set"
+    end
+    if not webdav.url_has_host(server_url) then
+        return 0, 0, "Server URL has no host (e.g. use https://example.com/webdav)"
+    end
+    if not local_folder or local_folder == "" then
+        return 0, 0, "Download folder is not set"
+    end
+    local_folder = local_folder:gsub("/+$", "")
+
+    logger.info(LOG .. "run_upload: url=" .. server_url .. " folder=" .. local_folder)
+    local extensions_set = parse_extensions(extensions_filter)
+    local local_files, scan_err = scan_local_files(local_folder, extensions_set)
+    if not local_files then
+        return 0, 0, "Local scan failed: " .. tostring(scan_err)
+    end
+    if #local_files == 0 then
+        logger.info(LOG .. "run_upload: no local files to upload")
+        return 0, 0, nil
+    end
+
+    local base = base_path_from_url(server_url)
+    local remote_set = {}
+    local list = webdav.list_all(server_url, username, password)
+    if list then
+        logger.info(LOG .. "run_upload: listed " .. #list .. " remote entries")
+        for _, e in ipairs(list) do
+            if not e.is_collection then
+                local rel = e.path:gsub("^/+", "")
+                if base ~= "" and rel:sub(1, #base) == base then
+                    rel = rel:sub(#base + 1):gsub("^/+", "")
+                end
+                remote_set[rel] = true
+            end
+        end
+    else
+        logger.warn(LOG .. "run_upload: list_all failed, uploading all local files without skip check")
+    end
+    -- If listing fails (e.g. server rejects PROPFIND), remote_set stays empty
+    -- and we attempt to upload everything; PUT is idempotent so overwriting is safe.
+
+    local count_ok = 0
+    local count_skipped = 0
+    local count_fail = 0
+    local failed_files = {}
+    local created_dirs = {}
+
+    for i, rel in ipairs(local_files) do
+        if remote_set[rel] then
+            count_skipped = count_skipped + 1
+        else
+            if progress_cb then progress_cb(i, #local_files, rel) end
+
+            -- Ensure each parent collection exists on the server
+            local dir_rel = rel:match("^(.+)/[^/]+$")
+            if dir_rel then
+                local path_acc = ""
+                for part in dir_rel:gmatch("[^/]+") do
+                    path_acc = path_acc == "" and part or (path_acc .. "/" .. part)
+                    if not created_dirs[path_acc] then
+                        webdav.mkcol(webdav.normalize_url(server_url) .. "/" .. path_acc, username, password)
+                        created_dirs[path_acc] = true
+                    end
+                end
+            end
+
+            local local_path = local_folder .. "/" .. rel
+            local remote_url = webdav.normalize_url(server_url) .. "/" .. rel
+            local ok, msg = webdav.upload_file(remote_url, local_path, username, password)
+            if ok then
+                count_ok = count_ok + 1
+            else
+                count_fail = count_fail + 1
+                local filename = rel:match("([^/]+)$") or rel
+                table.insert(failed_files, filename .. " (" .. tostring(msg) .. ")")
+            end
+        end
+    end
+
+    logger.info(LOG .. "run_upload done: uploaded=" .. count_ok .. " skipped=" .. count_skipped .. " failed=" .. count_fail)
+    if count_fail > 0 then
+        return count_ok, count_fail, tostring(count_fail) .. " file(s) failed:\n" .. table.concat(failed_files, "\n")
+    end
+    return count_ok, count_skipped, nil
+end
+
 return {
     run_sync = run_sync,
+    run_upload = run_upload,
     KOREADER_DEFAULT_EXTENSIONS = KOREADER_DEFAULT_EXTENSIONS,
 }

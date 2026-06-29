@@ -7,10 +7,13 @@ Matches KOReader's apps/cloudstorage/webdavapi.lua: socket.http, user/password i
 local ltn12 = require("ltn12")
 local socket = require("socket")
 local http = require("socket.http")
+local logger = require("logger")
 -- Use KOReader's socketutil for timeouts (same as WebDavApi)
 local socketutil
 local ok_su = pcall(function() socketutil = require("socketutil") end)
 if not ok_su or not socketutil then socketutil = false end
+
+local LOG = "[webdav-autosync] "
 
 --- URL encode a string (encode spaces and special characters)
 local function url_encode(str)
@@ -39,23 +42,6 @@ local function url_has_host(url)
     return host and host ~= ""
 end
 
---- Build request headers for WebDAV (no auth here - use user/password in request table like WebDavApi).
-local function headers(extra)
-    local h = {
-        ["Content-Type"] = "application/xml",
-        ["Depth"] = "1",
-    }
-    if extra then
-        for k, v in pairs(extra) do
-            h[k] = v
-        end
-    end
-    return h
-end
-
---- PROPFIND body: use empty/minimal like KOReader WebDavApi (some servers expect it).
-local PROPFIND_BODY = '<?xml version="1.0" encoding="utf-8"?><propfind xmlns="DAV:"><allprop/></propfind>'
-
 --- Parse PROPFIND XML response into list of { href, is_collection, path }.
 --- Accept any namespace prefix like WebDavApi (<*:response>, <*:href>, etc.).
 local function parse_propfind_response(body, base_url)
@@ -64,6 +50,8 @@ local function parse_propfind_response(body, base_url)
     for block in (body or ""):gmatch("<[^:]*:response[^>]*>.-</[^:]*:response>") do
         local href = block:match("<[^:]*:href[^>]*>([^<]+)</[^:]*:href>")
         if href then
+            -- Decode XML entities before percent-decoding
+            href = href:gsub("&amp;", "&"):gsub("&lt;", "<"):gsub("&gt;", ">"):gsub("&apos;", "'"):gsub("&quot;", '"')
             href = href:gsub("%%(%x%x)", function(x) return string.char(tonumber(x, 16)) end)
             local is_collection = not not block:match("<[^:]*:collection[^/]*/>")
             -- Normalize: remove server base and leading slashes for path
@@ -83,10 +71,11 @@ local function parse_propfind_response(body, base_url)
     return list
 end
 
+local PROPFIND_BODY = '<?xml version="1.0"?><a:propfind xmlns:a="DAV:"><a:prop><a:resourcetype/><a:getlastmodified/></a:prop></a:propfind>'
+
 --- List a WebDAV URL (single level). Returns list of { href, is_collection, path }.
---- Matches KOReader WebDavApi: trailing slash on URL, empty body, Content-Length, user/password, socketutil.
 function list_one(url, username, password, depth)
-    url = normalize_url(url)
+    url = url_encode(normalize_url(url))
     if not url_has_host(url) then
         return nil, nil, "host or service not provided, or not known"
     end
@@ -95,14 +84,16 @@ function list_one(url, username, password, depth)
         url = url .. "/"
     end
     depth = depth or "1"
+    logger.info(LOG .. "PROPFIND url=" .. url .. " depth=" .. depth .. " body_len=" .. #PROPFIND_BODY)
+    logger.info(LOG .. "PROPFIND body=" .. PROPFIND_BODY)
     local body = {}
     local request = {
         url = url,
         method = "PROPFIND",
         headers = {
             ["Content-Type"] = "application/xml",
-            ["Depth"] = depth,
             ["Content-Length"] = #PROPFIND_BODY,
+            ["Depth"] = depth,
         },
         source = ltn12.source.string(PROPFIND_BODY),
         sink = ltn12.sink.table(body),
@@ -118,8 +109,16 @@ function list_one(url, username, password, depth)
     end
     local body_str = table.concat(body)
     if type(code) ~= "number" or code < 200 or code > 299 then
+        logger.warn(LOG .. "PROPFIND failed: code=" .. tostring(code) .. " status=" .. tostring(status))
+        logger.warn(LOG .. "PROPFIND response body=" .. tostring(body_str))
+        if resp_headers then
+            for k, v in pairs(resp_headers) do
+                logger.warn(LOG .. "PROPFIND resp header: " .. tostring(k) .. "=" .. tostring(v))
+            end
+        end
         return nil, code or status, body_str or tostring(status)
     end
+    logger.info(LOG .. "PROPFIND ok: code=" .. tostring(code) .. " response_len=" .. #body_str)
     return parse_propfind_response(body_str, url), code
 end
 
@@ -162,6 +161,7 @@ end
 --- Returns true, or nil, error_message. Same request pattern as WebDavApi:downloadFile.
 function download_file(remote_url, local_path, username, password)
     local url = url_encode(normalize_url(remote_url))
+    logger.dbg(LOG .. "GET " .. url .. " -> " .. tostring(local_path))
     local body = {}
     local request = {
         url = url,
@@ -178,6 +178,7 @@ function download_file(remote_url, local_path, username, password)
         socketutil:reset_timeout()
     end
     if type(code) ~= "number" or code ~= 200 then
+        logger.warn(LOG .. "GET failed: code=" .. tostring(code) .. " url=" .. url)
         return nil, "HTTP " .. tostring(code)
     end
     -- Use path as-is if absolute, else relative to KOReader data dir
@@ -190,16 +191,97 @@ function download_file(remote_url, local_path, username, password)
     end
     local dir = lpath:match("^(.+)/[^/]+$")
     if dir then
-        local ok, lfs = pcall(require, "libs/libkoreader-lfs")
-        if not ok then lfs = require("lfs") end
-        if lfs and lfs.mkdir then lfs.mkdir(dir) end
+        local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+        if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
+        if ok_lfs and lfs and lfs.mkdir then
+            -- Create all parent directories recursively (mkdir -p)
+            local prefix = lpath:match("^/") and "/" or ""
+            local current = prefix
+            for part in dir:gmatch("[^/]+") do
+                current = current .. part
+                lfs.mkdir(current)
+                current = current .. "/"
+            end
+        end
     end
     local f, err = io.open(lpath, "wb")
-    if not f then return nil, err end
+    if not f then
+        logger.err(LOG .. "download_file: cannot write " .. tostring(lpath) .. ": " .. tostring(err))
+        return nil, err
+    end
     for _, chunk in ipairs(body) do
         f:write(chunk)
     end
     f:close()
+    return true
+end
+
+--- Create a collection (directory) on WebDAV. Returns true or nil, error_message.
+--- 405 Method Not Allowed means the collection already exists — treated as success.
+function mkcol(url, username, password)
+    url = url_encode(normalize_url(url))
+    if url:sub(-1) ~= "/" then url = url .. "/" end
+    logger.dbg(LOG .. "MKCOL " .. url)
+    local request = {
+        url = url,
+        method = "MKCOL",
+        headers = { ["Connection"] = "close" },
+        sink = ltn12.sink.table({}),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }
+    local code = socket.skip(1, http.request(request))
+    logger.dbg(LOG .. "MKCOL response: code=" .. tostring(code))
+    if type(code) == "number" and (code == 201 or code == 405) then
+        return true
+    end
+    logger.warn(LOG .. "MKCOL unexpected code=" .. tostring(code) .. " url=" .. url)
+    return nil, "HTTP " .. tostring(code)
+end
+
+--- Upload one local file to a WebDAV URL via PUT. Returns true or nil, error_message.
+function upload_file(remote_url, local_path, username, password)
+    local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
+    if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
+    local file_size = 0
+    if ok_lfs and lfs then
+        local attr = lfs.attributes(local_path)
+        if attr then file_size = attr.size or 0 end
+    end
+    local f, err = io.open(local_path, "rb")
+    if not f then
+        logger.err(LOG .. "upload_file: cannot open " .. tostring(local_path) .. ": " .. tostring(err))
+        return nil, "Cannot open: " .. tostring(err)
+    end
+    local url = url_encode(normalize_url(remote_url))
+    logger.dbg(LOG .. "PUT " .. url .. " size=" .. tostring(file_size))
+    local request = {
+        url = url,
+        method = "PUT",
+        headers = {
+            ["Content-Length"] = file_size,
+            ["Content-Type"] = "application/octet-stream",
+            ["Connection"] = "close",
+        },
+        source = ltn12.source.file(f),
+        sink = ltn12.sink.table({}),
+        user = (username and username ~= "") and username or nil,
+        password = (password and password ~= "") and password or nil,
+    }
+    if socketutil and socketutil.set_timeout then
+        socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
+    end
+    local code = socket.skip(1, http.request(request))
+    if socketutil and socketutil.reset_timeout then
+        socketutil:reset_timeout()
+    end
+    -- ltn12.source.file only closes on EOF; close explicitly in case of early server response
+    pcall(f.close, f)
+    if type(code) ~= "number" or code < 200 or code > 299 then
+        logger.warn(LOG .. "PUT failed: code=" .. tostring(code) .. " url=" .. url)
+        return nil, "HTTP " .. tostring(code)
+    end
+    logger.dbg(LOG .. "PUT ok: code=" .. tostring(code))
     return true
 end
 
@@ -209,4 +291,6 @@ return {
     list_one = list_one,
     list_all = list_all,
     download_file = download_file,
+    mkcol = mkcol,
+    upload_file = upload_file,
 }

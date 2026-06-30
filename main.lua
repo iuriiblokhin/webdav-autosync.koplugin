@@ -77,6 +77,16 @@ function WebDAVSync:addToMainMenu(menu_items)
                 end,
             },
             {
+                text = _("Ignore dotfiles"),
+                keep_menu_open = true,
+                checked_func = function()
+                    return self:getSetting("ignore_dotfiles", true)
+                end,
+                callback = function()
+                    self:saveSetting("ignore_dotfiles", not self:getSetting("ignore_dotfiles", true))
+                end,
+            },
+            {
                 text = _("Auto sync on startup"),
                 event = "AutoSyncOnStartup",
                 args = {true, false},
@@ -285,7 +295,8 @@ function WebDAVSync:doSync(is_auto, turn_off_wifi)
     local syncing_msg = InfoMessage:new{ text = _("Syncing…") }
     UIManager:show(syncing_msg)
     UIManager:forceRePaint()
-    local ok, skip, err = sync.run_sync(server_url, username, password, folder, nil, file_extensions)
+    local ignore_dotfiles = self:getSetting("ignore_dotfiles", true)
+    local ok, skip, err = sync.run_sync(server_url, username, password, folder, nil, file_extensions, ignore_dotfiles)
     if syncing_msg then
         UIManager:close(syncing_msg)
     end
@@ -355,7 +366,8 @@ function WebDAVSync:doUpload()
     local uploading_msg = InfoMessage:new{ text = _("Uploading…") }
     UIManager:show(uploading_msg)
     UIManager:forceRePaint()
-    local ok, skip, err = sync.run_upload(server_url, username, password, folder, nil, file_extensions)
+    local ignore_dotfiles = self:getSetting("ignore_dotfiles", true)
+    local ok, skip, err = sync.run_upload(server_url, username, password, folder, nil, file_extensions, ignore_dotfiles)
     UIManager:close(uploading_msg)
     if err then
         UIManager:show(InfoMessage:new{

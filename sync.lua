@@ -56,11 +56,20 @@ local function base_path_from_url(url)
     return path
 end
 
+--- Returns true if any component of a relative path starts with ".".
+local function is_dotfile(rel)
+    for part in rel:gmatch("[^/]+") do
+        if part:sub(1, 1) == "." then return true end
+    end
+    return false
+end
+
 --- Run full sync: list all resources, download every file to local_folder.
 --- local_folder: path on device (e.g. /mnt/onboard/books or relative path).
 --- extensions_filter: optional string (e.g. "epub, pdf"); empty/nil = all KOReader formats.
+--- ignore_dotfiles: if true, skip files/folders whose name starts with ".".
 --- Returns: count_downloaded, count_skipped, error_message (nil on success).
-function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter)
+function run_sync(server_url, username, password, local_folder, progress_cb, extensions_filter, ignore_dotfiles)
     if not server_url or type(server_url) ~= "string" then
         return 0, 0, "Server URL is not set"
     end
@@ -86,7 +95,12 @@ function run_sync(server_url, username, password, local_folder, progress_cb, ext
     local extensions_set = parse_extensions(extensions_filter)
     local files = {}
     for _, e in ipairs(list) do
-        if not e.is_collection and extension_allowed(e.path or "", extensions_set) then
+        local rel = (e.path or ""):gsub("^/+", "")
+        if base ~= "" and rel:sub(1, #base) == base then
+            rel = rel:sub(#base + 1):gsub("^/+", "")
+        end
+        if not e.is_collection and extension_allowed(rel, extensions_set)
+                and not (ignore_dotfiles and is_dotfile(rel)) then
             table.insert(files, e)
         end
     end
@@ -164,7 +178,7 @@ end
 
 --- Recursively scan local_folder for files matching extensions_set.
 --- Returns a list of relative paths (e.g. "subdir/book.epub"), or nil, err.
-local function scan_local_files(folder, extensions_set)
+local function scan_local_files(folder, extensions_set, ignore_dotfiles)
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
     if not ok_lfs or not lfs then
@@ -181,14 +195,18 @@ local function scan_local_files(folder, extensions_set)
         end
         for entry in iter, state do
             if entry ~= "." and entry ~= ".." then
-                local full = dir .. "/" .. entry
-                local rel = prefix == "" and entry or (prefix .. "/" .. entry)
-                local attr = lfs.attributes(full)
-                if attr then
-                    if attr.mode == "directory" then
-                        scan(full, rel)
-                    elseif attr.mode == "file" and extension_allowed(entry, extensions_set) then
-                        table.insert(files, rel)
+                if ignore_dotfiles and entry:sub(1, 1) == "." then
+                    -- skip dotfiles and dot-directories entirely
+                else
+                    local full = dir .. "/" .. entry
+                    local rel = prefix == "" and entry or (prefix .. "/" .. entry)
+                    local attr = lfs.attributes(full)
+                    if attr then
+                        if attr.mode == "directory" then
+                            scan(full, rel)
+                        elseif attr.mode == "file" and extension_allowed(entry, extensions_set) then
+                            table.insert(files, rel)
+                        end
                     end
                 end
             end
@@ -200,8 +218,9 @@ local function scan_local_files(folder, extensions_set)
 end
 
 --- Upload local files to WebDAV. Skips files already present on the server.
+--- ignore_dotfiles: if true, skip files/folders whose name starts with ".".
 --- Returns: count_uploaded, count_skipped, error_message (nil on success).
-function run_upload(server_url, username, password, local_folder, progress_cb, extensions_filter)
+function run_upload(server_url, username, password, local_folder, progress_cb, extensions_filter, ignore_dotfiles)
     if not server_url or type(server_url) ~= "string" then
         return 0, 0, "Server URL is not set"
     end
@@ -219,7 +238,7 @@ function run_upload(server_url, username, password, local_folder, progress_cb, e
 
     logger.info(LOG .. "run_upload: url=" .. server_url .. " folder=" .. local_folder)
     local extensions_set = parse_extensions(extensions_filter)
-    local local_files, scan_err = scan_local_files(local_folder, extensions_set)
+    local local_files, scan_err = scan_local_files(local_folder, extensions_set, ignore_dotfiles)
     if not local_files then
         return 0, 0, "Local scan failed: " .. tostring(scan_err)
     end

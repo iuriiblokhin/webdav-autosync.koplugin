@@ -74,7 +74,8 @@ end
 local PROPFIND_BODY = '<?xml version="1.0"?><a:propfind xmlns:a="DAV:"><a:prop><a:resourcetype/><a:getlastmodified/></a:prop></a:propfind>'
 
 --- List a WebDAV URL (single level). Returns list of { href, is_collection, path }.
-function list_one(url, username, password, depth)
+--- silent=true suppresses warning logs on failure (used for probing Depth:infinity).
+local function list_one(url, username, password, depth, silent)
     url = url_encode(normalize_url(url))
     if not url_has_host(url) then
         return nil, nil, "host or service not provided, or not known"
@@ -84,8 +85,7 @@ function list_one(url, username, password, depth)
         url = url .. "/"
     end
     depth = depth or "1"
-    logger.info(LOG .. "PROPFIND url=" .. url .. " depth=" .. depth .. " body_len=" .. #PROPFIND_BODY)
-    logger.info(LOG .. "PROPFIND body=" .. PROPFIND_BODY)
+    logger.info(LOG .. "PROPFIND url=" .. url .. " depth=" .. depth)
     local body = {}
     local request = {
         url = url,
@@ -109,11 +109,13 @@ function list_one(url, username, password, depth)
     end
     local body_str = table.concat(body)
     if type(code) ~= "number" or code < 200 or code > 299 then
-        logger.warn(LOG .. "PROPFIND failed: code=" .. tostring(code) .. " status=" .. tostring(status))
-        logger.warn(LOG .. "PROPFIND response body=" .. tostring(body_str))
-        if resp_headers then
-            for k, v in pairs(resp_headers) do
-                logger.warn(LOG .. "PROPFIND resp header: " .. tostring(k) .. "=" .. tostring(v))
+        if not silent then
+            logger.warn(LOG .. "PROPFIND failed: code=" .. tostring(code) .. " status=" .. tostring(status))
+            logger.warn(LOG .. "PROPFIND response body=" .. tostring(body_str))
+            if resp_headers then
+                for k, v in pairs(resp_headers) do
+                    logger.warn(LOG .. "PROPFIND resp header: " .. tostring(k) .. "=" .. tostring(v))
+                end
             end
         end
         return nil, code or status, body_str or tostring(status)
@@ -122,30 +124,52 @@ function list_one(url, username, password, depth)
     return parse_propfind_response(body_str, url), code
 end
 
---- Recursively collect all file URLs under base_url (directories traversed).
---- Returns flat list of { href, is_collection, path } for all resources.
-function list_all(base_url, username, password)
+--- Collect all entries under base_url. Tries Depth:infinity first (single request);
+--- falls back to recursive Depth:1 if the server rejects it.
+--- Returns flat list of { href, is_collection, path, href_full } for all resources.
+local function list_all(base_url, username, password)
     base_url = normalize_url(base_url)
     local base_domain = base_url:match("^(https?://[^/]+)")
+    local root_path = base_url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
+
+    local function make_href_full(e)
+        if e.href:match("^https?://") then return e.href end
+        return base_domain and (base_domain .. e.href:gsub("^/+", "/")) or e.href
+    end
+
+    local function filter_entries(list, self_path)
+        local out = {}
+        for _, e in ipairs(list) do
+            local norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+            if norm ~= self_path and norm ~= "" then
+                e.href_full = make_href_full(e)
+                table.insert(out, e)
+            end
+        end
+        return out
+    end
+
+    -- Try Depth:infinity (single request, supported by many servers)
+    local inf_list = list_one(base_url, username, password, "infinity", true)
+    if inf_list then
+        logger.info(LOG .. "list_all: Depth:infinity ok, " .. #inf_list .. " entries")
+        return filter_entries(inf_list, root_path)
+    end
+
+    -- Fall back to recursive Depth:1
+    logger.info(LOG .. "list_all: Depth:infinity unsupported, using recursive Depth:1")
     local all = {}
     local function recurse(url)
         local list, code, err = list_one(url, username, password, "1")
-        if not list then
-            return nil, code, err
-        end
+        if not list then return nil, code, err end
+        local url_path = url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
         for _, e in ipairs(list) do
-            local href_full = e.href
-            if not href_full:match("^https?://") and base_domain then
-                href_full = base_domain .. (href_full:gsub("^/+", "/"))
-            end
-            -- Skip the requested URL itself
-            local url_path = url:gsub("^https?://[^/]+", ""):gsub("^/+", ""):gsub("/+$", "")
-            local e_path_norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
-            if e_path_norm ~= url_path and e_path_norm ~= "" then
-                e.href_full = href_full
+            local norm = (e.path or ""):gsub("^/+", ""):gsub("/+$", "")
+            if norm ~= url_path and norm ~= "" then
+                e.href_full = make_href_full(e)
                 table.insert(all, e)
                 if e.is_collection then
-                    local ok, c, m = recurse(href_full)
+                    local ok, c, m = recurse(e.href_full)
                     if not ok then return nil, c, m end
                 end
             end
@@ -159,7 +183,7 @@ end
 
 --- Download one file from WebDAV URL to local path. Creates parent dirs.
 --- Returns true, or nil, error_message. Same request pattern as WebDavApi:downloadFile.
-function download_file(remote_url, local_path, username, password)
+local function download_file(remote_url, local_path, username, password)
     local url = url_encode(normalize_url(remote_url))
     logger.dbg(LOG .. "GET " .. url .. " -> " .. tostring(local_path))
     local body = {}
@@ -218,7 +242,7 @@ end
 
 --- Create a collection (directory) on WebDAV. Returns true or nil, error_message.
 --- 405 Method Not Allowed means the collection already exists — treated as success.
-function mkcol(url, username, password)
+local function mkcol(url, username, password)
     url = url_encode(normalize_url(url))
     if url:sub(-1) ~= "/" then url = url .. "/" end
     logger.dbg(LOG .. "MKCOL " .. url)
@@ -240,7 +264,7 @@ function mkcol(url, username, password)
 end
 
 --- Upload one local file to a WebDAV URL via PUT. Returns true or nil, error_message.
-function upload_file(remote_url, local_path, username, password)
+local function upload_file(remote_url, local_path, username, password)
     local ok_lfs, lfs = pcall(require, "libs/libkoreader-lfs")
     if not ok_lfs then ok_lfs, lfs = pcall(require, "lfs") end
     local file_size = 0

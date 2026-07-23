@@ -482,6 +482,10 @@ local function diff_indices(remote_index, local_index, cache_files)
     local deletions   = {}
     local seen_rel    = {}
 
+    logger.dbg(LOG .. "diff_indices: remote=" .. tostring(#(function() local t={} for k in pairs(remote_index) do t[#t+1]=k end return t end)())
+        .. " local=" .. tostring(#(function() local t={} for k in pairs(local_index) do t[#t+1]=k end return t end)())
+        .. " cached=" .. tostring(#(function() local t={} for k in pairs(cache_files) do t[#t+1]=k end return t end)()))
+
     -- Process everything present on the remote.
     for rel, remote in pairs(remote_index) do
         seen_rel[rel] = true
@@ -494,6 +498,7 @@ local function diff_indices(remote_index, local_index, cache_files)
             if loc then
                 -- Both sides have the file but no cache baseline yet (first run).
                 -- Assume in sync; seed the cache so future runs detect real changes.
+                logger.dbg(LOG .. "diff seed (no cache, both sides): " .. rel)
                 cache_files[rel] = {
                     remote_etag  = remote.etag,
                     remote_mtime = remote.mtime,
@@ -502,14 +507,27 @@ local function diff_indices(remote_index, local_index, cache_files)
                 }
             else
                 -- File only on remote, never seen locally: download.
+                logger.dbg(LOG .. "diff download (no cache, remote only): " .. rel)
                 table.insert(to_download, { rel = rel, remote = remote })
             end
         elseif r_chg and l_chg then
+            logger.dbg(LOG .. "diff conflict (both changed): " .. rel
+                .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
+                .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
+                .. " loc_size=" .. tostring(loc and loc.size) .. " c_loc_size=" .. tostring(cached.local_size)
+                .. " loc_mtime=" .. tostring(loc and loc.mtime) .. " c_loc_mtime=" .. tostring(cached.local_mtime))
             table.insert(conflicts, { rel = rel, remote = remote, local_file = loc })
         elseif r_chg then
+            logger.dbg(LOG .. "diff download (remote changed): " .. rel
+                .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
+                .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
+                .. " local_in_index=" .. tostring(loc ~= nil))
             table.insert(to_download, { rel = rel, remote = remote })
         elseif l_chg and loc then
+            logger.dbg(LOG .. "diff upload (local changed): " .. rel)
             table.insert(to_upload, { rel = rel, local_file = loc })
+        else
+            logger.dbg(LOG .. "diff skip (unchanged): " .. rel)
         end
     end
 
@@ -519,9 +537,15 @@ local function diff_indices(remote_index, local_index, cache_files)
             local cached = cache_files[rel]
             if not cached then
                 -- New local file: upload.
+                logger.dbg(LOG .. "diff upload (local only, no cache): " .. rel)
                 table.insert(to_upload, { rel = rel, local_file = loc })
             else
                 -- Known file vanished from remote: remote deleted it.
+                logger.dbg(LOG .. "diff deletion (in local+cache, not remote): " .. rel
+                    .. " c_r_etag=" .. tostring(cached.remote_etag)
+                    .. " c_r_mtime=" .. tostring(cached.remote_mtime)
+                    .. " c_loc_size=" .. tostring(cached.local_size)
+                    .. " c_loc_mtime=" .. tostring(cached.local_mtime))
                 table.insert(deletions, { rel = rel, side = "remote_deleted", local_file = loc })
             end
         end
@@ -579,6 +603,16 @@ local function plan(ctx)
     if not cache_settings then
         logger.warn(LOG .. "plan: cache unavailable (" .. tostring(cache_err) .. ") — treating all as new")
         cache_files = {}
+    else
+        cache_files = cache_files or {}
+        local n = 0; for _ in pairs(cache_files) do n = n + 1 end
+        logger.dbg(LOG .. "plan: cache loaded, " .. n .. " entries")
+        for rel, c in pairs(cache_files) do
+            logger.dbg(LOG .. "  cache[" .. rel .. "] r_etag=" .. tostring(c.remote_etag)
+                .. " r_mtime=" .. tostring(c.remote_mtime)
+                .. " loc_size=" .. tostring(c.local_size)
+                .. " loc_mtime=" .. tostring(c.local_mtime))
+        end
     end
 
     local actions  = diff_indices(remote_index, local_index, cache_files)

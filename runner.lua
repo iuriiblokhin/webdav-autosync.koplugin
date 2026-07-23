@@ -64,8 +64,8 @@ local function resolve_conflicts(p, conflicts, idx, on_done)
     local dlg = {}  -- forward reference so buttons can close the dialog
     dlg[1] = ButtonDialogTitle:new{
         title = T(
-            _("Conflict: %1\n\nBoth the local copy and the server copy changed since the last sync."),
-            rel),
+            _("Conflict (%1/%2): %3\n\nBoth the local copy and the server copy changed since the last sync."),
+            idx, #conflicts, rel),
         buttons = {
             {
                 {
@@ -114,13 +114,13 @@ local function resolve_deletions(p, deletions, on_done)
     end
     local names = {}
     for i, d in ipairs(deletions) do
-        if i <= 5 then table.insert(names, d.rel:match("([^/]+)$") or d.rel) end
+        if i <= 5 then table.insert(names, d.rel) end
     end
     if #deletions > 5 then
         table.insert(names, T(_("… and %1 more"), #deletions - 5))
     end
     local title = T(
-        _("%1 file(s) were removed from the server. What should happen to the local copies?\n\n%2"),
+        _("%1 file(s) no longer exist on the server (they may have been deleted or moved). Remove local copies?\n\n%2"),
         #deletions, table.concat(names, "\n"))
 
     local dlg = {}

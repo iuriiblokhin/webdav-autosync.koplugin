@@ -263,6 +263,7 @@ local function run_upload(server_url, username, password, local_folder, progress
     local count_fail = 0
     local failed_files = {}
     local created_dirs = {}
+    local uploaded_rels = {}
 
     for i, rel in ipairs(local_files) do
         if remote_set[rel] then
@@ -288,11 +289,28 @@ local function run_upload(server_url, username, password, local_folder, progress
             local ok, msg = webdav.upload_file(remote_url, local_path, username, password)
             if ok then
                 count_ok = count_ok + 1
+                table.insert(uploaded_rels, rel)
             else
                 count_fail = count_fail + 1
                 local filename = rel:match("([^/]+)$") or rel
                 table.insert(failed_files, filename .. " (" .. tostring(msg) .. ")")
             end
+        end
+    end
+
+    -- Invalidate two-way cache entries for uploaded files. A PUT creates a new
+    -- server-side etag; without invalidation the next two-way sync would see a
+    -- stale cached etag, treat the file as "remote changed", and re-download it.
+    -- Removing the entry causes two-way sync to re-seed it on the next run
+    -- (both sides present, no cache → seed baseline, no download).
+    if #uploaded_rels > 0 then
+        local cs, cf = open_cache(server_url, local_folder)
+        if cs and cf then
+            for _, rel in ipairs(uploaded_rels) do
+                cf[rel] = nil
+            end
+            cs:saveSetting("files", cf)
+            cs:flush()
         end
     end
 
@@ -306,6 +324,11 @@ end
 -- ============================================================
 -- Two-way sync: cache, plan, diff, execute
 -- ============================================================
+
+-- Forward declaration so run_upload (defined above) can call open_cache
+-- (defined below). Lua closures capture the variable slot, not the value,
+-- so the assignment below fills this in before any caller can reach it.
+local open_cache
 
 local _LuaSettings
 local _DataStorage
@@ -431,7 +454,7 @@ end
 
 --- Open (or create) the LuaSettings cache file for this server+folder pair.
 --- Returns settings_obj, files_table  or  nil, nil, error_message.
-local function open_cache(server_url, local_folder)
+open_cache = function(server_url, local_folder)
     local LS, DS = get_settings_modules()
     if not LS or not DS then
         return nil, nil, "LuaSettings/DataStorage not available"

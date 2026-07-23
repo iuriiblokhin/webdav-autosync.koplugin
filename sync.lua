@@ -468,8 +468,19 @@ local function diff_indices(remote_index, local_index, cache_files)
         local l_chg    = loc and local_changed(loc, cached) or false
 
         if not cached then
-            -- First time seeing this file: remote wins.
-            table.insert(to_download, { rel = rel, remote = remote })
+            if loc then
+                -- Both sides have the file but no cache baseline yet (first run).
+                -- Assume in sync; seed the cache so future runs detect real changes.
+                cache_files[rel] = {
+                    remote_etag  = remote.etag,
+                    remote_mtime = remote.mtime,
+                    local_mtime  = loc.mtime,
+                    local_size   = loc.size,
+                }
+            else
+                -- File only on remote, never seen locally: download.
+                table.insert(to_download, { rel = rel, remote = remote })
+            end
         elseif r_chg and l_chg then
             table.insert(conflicts, { rel = rel, remote = remote, local_file = loc })
         elseif r_chg then

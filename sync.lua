@@ -607,12 +607,6 @@ local function plan(ctx)
         cache_files = cache_files or {}
         local n = 0; for _ in pairs(cache_files) do n = n + 1 end
         logger.dbg(LOG .. "plan: cache loaded, " .. n .. " entries")
-        for rel, c in pairs(cache_files) do
-            logger.dbg(LOG .. "  cache[" .. rel .. "] r_etag=" .. tostring(c.remote_etag)
-                .. " r_mtime=" .. tostring(c.remote_mtime)
-                .. " loc_size=" .. tostring(c.local_size)
-                .. " loc_mtime=" .. tostring(c.local_mtime))
-        end
     end
 
     local actions  = diff_indices(remote_index, local_index, cache_files)

@@ -2,11 +2,11 @@
 Two-way sync runner: UI dialogs, action loop, in-flight lock.
 --]]--
 
-local UIManager    = require("ui/uimanager")
-local InfoMessage  = require("ui/widget/infomessage")
+local UIManager         = require("ui/uimanager")
+local InfoMessage       = require("ui/widget/infomessage")
 local ButtonDialogTitle = require("ui/widget/buttondialogtitle")
-local T = require("ffi/util").template
-local _ = require("gettext")
+local T   = require("ffi/util").template
+local _   = require("gettext")
 local logger = require("logger")
 local sync = require("sync")
 
@@ -18,24 +18,12 @@ local sync_in_flight = false
 --- Format a summary string from a stats table.
 local function format_summary(stats)
     local parts = {}
-    if (stats.downloaded or 0) > 0 then
-        table.insert(parts, T(_("%1 downloaded"), stats.downloaded))
-    end
-    if (stats.uploaded or 0) > 0 then
-        table.insert(parts, T(_("%1 uploaded"), stats.uploaded))
-    end
-    if (stats.deleted_remote or 0) > 0 then
-        table.insert(parts, T(_("%1 removed from server"), stats.deleted_remote))
-    end
-    if (stats.deleted_local or 0) > 0 then
-        table.insert(parts, T(_("%1 removed locally"), stats.deleted_local))
-    end
-    if (stats.skipped or 0) > 0 then
-        table.insert(parts, T(_("%1 skipped"), stats.skipped))
-    end
-    if (stats.errors or 0) > 0 then
-        table.insert(parts, T(_("%1 error(s)"), stats.errors))
-    end
+    if (stats.downloaded    or 0) > 0 then table.insert(parts, T(_("%1 downloaded"),         stats.downloaded))    end
+    if (stats.uploaded      or 0) > 0 then table.insert(parts, T(_("%1 uploaded"),            stats.uploaded))      end
+    if (stats.deleted_remote or 0) > 0 then table.insert(parts, T(_("%1 removed from server"), stats.deleted_remote)) end
+    if (stats.deleted_local  or 0) > 0 then table.insert(parts, T(_("%1 removed locally"),    stats.deleted_local))  end
+    if (stats.skipped       or 0) > 0 then table.insert(parts, T(_("%1 skipped"),             stats.skipped))       end
+    if (stats.errors        or 0) > 0 then table.insert(parts, T(_("%1 error(s)"),            stats.errors))        end
     if #parts == 0 then return _("Nothing to do — already in sync.") end
     return table.concat(parts, ", ") .. "."
 end
@@ -49,16 +37,15 @@ local function show_summary(stats, on_done)
     if on_done then on_done(stats) end
 end
 
---- Execute all actions in a flat list of the same kind, then call next_fn.
+--- Execute all actions in a flat list of the same kind, then call on_done.
 local function run_actions(p, kind, actions, idx, on_done)
     idx = idx or 1
     if idx > #actions then
         if on_done then on_done() end
         return
     end
-    local action = actions[idx]
-    sync.do_action(p, kind, action)
-    -- Schedule next tick so KOReader's event loop stays responsive.
+    sync.do_action(p, kind, actions[idx])
+    -- Yield to event loop so the device stays responsive.
     UIManager:scheduleIn(0, function()
         run_actions(p, kind, actions, idx + 1, on_done)
     end)
@@ -72,16 +59,19 @@ local function resolve_conflicts(p, conflicts, idx, on_done)
         if on_done then on_done() end
         return
     end
-    local c = conflicts[idx]
+    local c   = conflicts[idx]
     local rel = c.rel
-    UIManager:show(ButtonDialogTitle:new{
-        title = T(_("Conflict: %1\n\nBoth the local copy and the server copy have changed since last sync."), rel),
+    local dlg = {}  -- forward reference so buttons can close the dialog
+    dlg[1] = ButtonDialogTitle:new{
+        title = T(
+            _("Conflict: %1\n\nBoth the local copy and the server copy changed since the last sync."),
+            rel),
         buttons = {
             {
                 {
                     text = _("Keep server copy"),
                     callback = function()
-                        UIManager:close(UIManager:getTopWidget())
+                        UIManager:close(dlg[1])
                         sync.do_action(p, "download", { rel = rel, remote = c.remote })
                         UIManager:scheduleIn(0, function()
                             resolve_conflicts(p, conflicts, idx + 1, on_done)
@@ -91,7 +81,7 @@ local function resolve_conflicts(p, conflicts, idx, on_done)
                 {
                     text = _("Keep local copy"),
                     callback = function()
-                        UIManager:close(UIManager:getTopWidget())
+                        UIManager:close(dlg[1])
                         sync.do_action(p, "upload", { rel = rel, local_file = c.local_file })
                         UIManager:scheduleIn(0, function()
                             resolve_conflicts(p, conflicts, idx + 1, on_done)
@@ -103,7 +93,7 @@ local function resolve_conflicts(p, conflicts, idx, on_done)
                 {
                     text = _("Skip"),
                     callback = function()
-                        UIManager:close(UIManager:getTopWidget())
+                        UIManager:close(dlg[1])
                         p.stats.skipped = (p.stats.skipped or 0) + 1
                         UIManager:scheduleIn(0, function()
                             resolve_conflicts(p, conflicts, idx + 1, on_done)
@@ -112,11 +102,11 @@ local function resolve_conflicts(p, conflicts, idx, on_done)
                 },
             },
         },
-    })
+    }
+    UIManager:show(dlg[1])
 end
 
 --- Batch dialog for files deleted on the server that still exist locally.
---- Options: remove all local copies / keep all / review one by one.
 local function resolve_deletions(p, deletions, on_done)
     if #deletions == 0 then
         if on_done then on_done() end
@@ -126,44 +116,40 @@ local function resolve_deletions(p, deletions, on_done)
     for i, d in ipairs(deletions) do
         if i <= 5 then table.insert(names, d.rel:match("([^/]+)$") or d.rel) end
     end
-    if #deletions > 5 then table.insert(names, T(_("… and %1 more"), #deletions - 5)) end
+    if #deletions > 5 then
+        table.insert(names, T(_("… and %1 more"), #deletions - 5))
+    end
     local title = T(
         _("%1 file(s) were removed from the server. What should happen to the local copies?\n\n%2"),
         #deletions, table.concat(names, "\n"))
 
-    local function delete_all()
-        for _, d in ipairs(deletions) do
-            sync.do_action(p, "delete_local", { rel = d.rel })
-        end
-        if on_done then on_done() end
-    end
-
-    local function keep_all()
-        p.stats.skipped = (p.stats.skipped or 0) + #deletions
-        if on_done then on_done() end
-    end
-
-    UIManager:show(ButtonDialogTitle:new{
+    local dlg = {}
+    dlg[1] = ButtonDialogTitle:new{
         title = title,
         buttons = {
             {
                 {
                     text = _("Remove local copies"),
                     callback = function()
-                        UIManager:close(UIManager:getTopWidget())
-                        delete_all()
+                        UIManager:close(dlg[1])
+                        for _, d in ipairs(deletions) do
+                            sync.do_action(p, "delete_local", { rel = d.rel })
+                        end
+                        if on_done then on_done() end
                     end,
                 },
                 {
                     text = _("Keep local copies"),
                     callback = function()
-                        UIManager:close(UIManager:getTopWidget())
-                        keep_all()
+                        UIManager:close(dlg[1])
+                        p.stats.skipped = (p.stats.skipped or 0) + #deletions
+                        if on_done then on_done() end
                     end,
                 },
             },
         },
-    })
+    }
+    UIManager:show(dlg[1])
 end
 
 --- Main two-way sync orchestrator.
@@ -186,7 +172,7 @@ local function run_two_way(ctx, on_done)
         show_summary(stats, on_done)
     end
 
-    -- Build plan on next tick so the "Syncing…" message is visible.
+    -- Build plan on next tick so "Syncing…" is visible before we block on I/O.
     UIManager:scheduleIn(0, function()
         local p, err = sync.plan(ctx)
         if not p then
@@ -204,15 +190,11 @@ local function run_two_way(ctx, on_done)
             .. " conflicts=" .. #p.conflicts
             .. " deletions=" .. #p.deletions)
 
-        -- Phase 1: downloads
+        -- Phase 1: downloads → Phase 2: uploads → Phase 3: conflicts → Phase 4: deletions
         run_actions(p, "download", p.to_download, 1, function()
-            -- Phase 2: uploads
             run_actions(p, "upload", p.to_upload, 1, function()
-                -- Phase 3: interactive conflict resolution
                 resolve_conflicts(p, p.conflicts, 1, function()
-                    -- Phase 4: interactive deletion resolution
                     resolve_deletions(p, p.deletions, function()
-                        -- Flush cache and finish.
                         sync.save_cache(p)
                         release(p.stats)
                     end)

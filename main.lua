@@ -12,6 +12,7 @@ local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local MultiInputDialog = require("ui/widget/multiinputdialog")
 local sync = require("sync")
+local runner = require("runner")
 local T = require("ffi/util").template
 local _ = require("gettext")
 
@@ -39,6 +40,96 @@ function WebDAVSync:init()
     end
 end
 
+function WebDAVSync:doImportFromCloud()
+    -- Try the plugin's own cloudstorage UI first, then fall back to SyncService.
+    local handler = function(server)
+        if not server then return end
+        if server.type ~= "webdav" then
+            UIManager:show(InfoMessage:new{ text = _("Please pick a WebDAV server from the list.") })
+            return
+        end
+        local server_url = (server.address or ""):gsub("/+$", "")
+        local start = server.url or ""
+        if start ~= "" then
+            if not start:match("^/") then start = "/" .. start end
+            server_url = server_url .. start
+        end
+        self:saveSetting("server_url", server_url)
+        self:saveSetting("username", server.username or "")
+        self:saveSetting("password", server.password or "")
+        local label = (server.name and server.name ~= "") and server.name or (server.address or "")
+        UIManager:show(InfoMessage:new{
+            text = T(_("Imported WebDAV server '%1'."), label),
+        })
+    end
+
+    local cs = self.ui and self.ui.cloudstorage
+    if cs and cs.onShowCloudStorageList then
+        cs:onShowCloudStorageList(handler)
+        return
+    end
+
+    local ok, SyncService = pcall(require, "frontend/apps/cloudstorage/syncservice")
+    if ok and SyncService then
+        local picker = SyncService:new{}
+        picker.onClose   = function(this) UIManager:close(this) end
+        picker.onConfirm = handler
+        UIManager:show(picker)
+        return
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = _("KOReader's Cloud storage feature is not available on this device."),
+    })
+end
+
+function WebDAVSync:doTwoWaySync()
+    local NetworkMgr = require("ui/network/manager")
+    if NetworkMgr.isWifiOn and not NetworkMgr:isWifiOn() then
+        UIManager:show(ConfirmBox:new{
+            text = _("WiFi is not enabled. Turn on WiFi now?"),
+            ok_text = _("Turn on WiFi"),
+            ok_callback = function()
+                NetworkMgr:turnOnWifi(function() self:doTwoWaySync() end)
+            end,
+        })
+        return
+    end
+
+    local server_url = self:getSetting("server_url", "")
+    if type(server_url) == "string" then
+        server_url = server_url:gsub("^%s+", ""):gsub("%s+$", "")
+    else
+        server_url = ""
+    end
+    if not server_url or server_url == "" then
+        UIManager:show(ConfirmBox:new{
+            text = _("WebDAV server not set. Set it now?"),
+            ok_text = _("WebDAV server"),
+            ok_callback = function() self:setWebDAVServer() end,
+        })
+        return
+    end
+    local folder = self:getSetting("download_folder", "")
+    if not folder or folder == "" then
+        UIManager:show(ConfirmBox:new{
+            text = _("Download folder not set. Choose folder now?"),
+            ok_text = _("Choose folder"),
+            ok_callback = function() self:setDownloadFolder() end,
+        })
+        return
+    end
+
+    runner.run_two_way({
+        server_url      = server_url,
+        username        = self:getSetting("username", ""),
+        password        = self:getSetting("password", ""),
+        local_folder    = folder,
+        extensions_filter = self:getSetting("file_extensions", ""),
+        ignore_dotfiles = self:getSetting("ignore_dotfiles", true),
+    })
+end
+
 function WebDAVSync:addToMainMenu(menu_items)
     menu_items.webdav_sync = {
         text = _("WebDAV Sync"),
@@ -47,6 +138,12 @@ function WebDAVSync:addToMainMenu(menu_items)
                 text = _("Sync now"),
                 callback = function()
                     self:doSync(false)
+                end,
+            },
+            {
+                text = _("Two-way sync"),
+                callback = function()
+                    self:doTwoWaySync()
                 end,
             },
             {
@@ -60,6 +157,13 @@ function WebDAVSync:addToMainMenu(menu_items)
                 keep_menu_open = true,
                 callback = function()
                     self:setWebDAVServer()
+                end,
+            },
+            {
+                text = _("Import from KOReader cloud storage"),
+                keep_menu_open = true,
+                callback = function()
+                    self:doImportFromCloud()
                 end,
             },
             {

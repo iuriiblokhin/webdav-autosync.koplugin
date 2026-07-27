@@ -65,6 +65,23 @@ local function is_dotfile(rel)
     return false
 end
 
+-- Normalise a rel string to Unicode NFC for the Cyrillic combining characters
+-- that commonly appear in Russian filenames when copied from macOS (which uses NFD).
+-- NFD stores й as и+combining-breve and ё as е+combining-diaeresis; servers like
+-- Koofr normalise PUT paths to NFC, so the returned PROPFIND href differs from
+-- lfs.dir() output on the device that uploaded the file.
+local function nfc_rel(s)
+    -- й: U+0438 U+0306 → U+0439
+    s = s:gsub("\xD0\xB8\xCC\x86", "\xD0\xB9")
+    -- Й: U+0418 U+0306 → U+0419
+    s = s:gsub("\xD0\x98\xCC\x86", "\xD0\x99")
+    -- ё: U+0435 U+0308 → U+0451
+    s = s:gsub("\xD0\xB5\xCC\x88", "\xD1\x91")
+    -- Ё: U+0415 U+0308 → U+0401
+    s = s:gsub("\xD0\x95\xCC\x88", "\xD0\x81")
+    return s
+end
+
 --- Run full sync: list all resources, download every file to local_folder.
 --- local_folder: path on device (e.g. /mnt/onboard/books or relative path).
 --- extensions_filter: optional string (e.g. "epub, pdf"); empty/nil = all KOReader formats.
@@ -307,7 +324,7 @@ local function run_upload(server_url, username, password, local_folder, progress
         local cs, cf = open_cache(server_url, local_folder)
         if cs and cf then
             for _, rel in ipairs(uploaded_rels) do
-                cf[rel] = nil
+                cf[nfc_rel(rel)] = nil
             end
             cs:saveSetting("files", cf)
             cs:flush()
@@ -432,7 +449,7 @@ local function build_remote_index(list, base, server_url)
             if base ~= "" and rel:sub(1, #base) == base then
                 rel = rel:sub(#base + 1):gsub("^/+", "")
             end
-            rel = rel:gsub("/+$", "")
+            rel = nfc_rel(rel:gsub("/+$", ""))
             if rel ~= "" and rel_is_safe(rel) then
                 local href = e.href_full or e.href
                 if not href:match("^https?://") then
@@ -507,7 +524,8 @@ local function diff_indices(remote_index, local_index, cache_files)
                 }
             else
                 -- File only on remote, never seen locally: download.
-                logger.dbg(LOG .. "diff download (no cache, remote only): " .. rel)
+                local hex = rel:gsub(".", function(c) return string.format("%02x", c:byte()) end)
+                logger.dbg(LOG .. "diff download (no cache, remote only): " .. rel .. "  HEX:" .. hex)
                 table.insert(to_download, { rel = rel, remote = remote })
             end
         elseif r_chg and l_chg then
@@ -518,10 +536,12 @@ local function diff_indices(remote_index, local_index, cache_files)
                 .. " loc_mtime=" .. tostring(loc and loc.mtime) .. " c_loc_mtime=" .. tostring(cached.local_mtime))
             table.insert(conflicts, { rel = rel, remote = remote, local_file = loc })
         elseif r_chg then
+            local dl_hex = rel:gsub(".", function(c) return string.format("%02x", c:byte()) end)
             logger.dbg(LOG .. "diff download (remote changed): " .. rel
                 .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
                 .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
-                .. " local_in_index=" .. tostring(loc ~= nil))
+                .. " local_in_index=" .. tostring(loc ~= nil)
+                .. "  HEX:" .. dl_hex)
             table.insert(to_download, { rel = rel, remote = remote })
         elseif l_chg and loc then
             logger.dbg(LOG .. "diff upload (local changed): " .. rel)
@@ -541,11 +561,13 @@ local function diff_indices(remote_index, local_index, cache_files)
                 table.insert(to_upload, { rel = rel, local_file = loc })
             else
                 -- Known file vanished from remote: remote deleted it.
+                local del_hex = rel:gsub(".", function(c) return string.format("%02x", c:byte()) end)
                 logger.dbg(LOG .. "diff deletion (in local+cache, not remote): " .. rel
                     .. " c_r_etag=" .. tostring(cached.remote_etag)
                     .. " c_r_mtime=" .. tostring(cached.remote_mtime)
                     .. " c_loc_size=" .. tostring(cached.local_size)
-                    .. " c_loc_mtime=" .. tostring(cached.local_mtime))
+                    .. " c_loc_mtime=" .. tostring(cached.local_mtime)
+                    .. "  HEX:" .. del_hex)
                 table.insert(deletions, { rel = rel, side = "remote_deleted", local_file = loc })
             end
         end
@@ -594,8 +616,9 @@ local function plan(ctx)
     end
     local local_index = {}
     for _, f in ipairs(local_list) do
-        if rel_is_safe(f.rel) then
-            local_index[f.rel] = f
+        local nrel = nfc_rel(f.rel)
+        if rel_is_safe(nrel) then
+            local_index[nrel] = f
         end
     end
 

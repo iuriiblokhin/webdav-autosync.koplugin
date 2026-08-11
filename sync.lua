@@ -262,7 +262,7 @@ local function run_upload(server_url, username, password, local_folder, progress
             if base ~= "" and rel:sub(1, #base) == base then
                 rel = rel:sub(#base + 1):gsub("^/+", "")
             end
-            rel = rel:gsub("/+$", "")
+            rel = nfc_rel(rel:gsub("/+$", ""))
             if e.is_collection then
                 remote_dirs[rel] = true
             else
@@ -283,13 +283,15 @@ local function run_upload(server_url, username, password, local_folder, progress
     local uploaded_rels = {}
 
     for i, rel in ipairs(local_files) do
-        if remote_set[rel] then
+        local nrel = nfc_rel(rel)
+        if remote_set[nrel] then
             count_skipped = count_skipped + 1
         else
             if progress_cb then progress_cb(i, #local_files, rel) end
 
-            -- Ensure each parent collection exists on the server
-            local dir_rel = rel:match("^(.+)/[^/]+$")
+            -- Ensure each parent collection exists on the server.
+            -- Use nrel (NFC) for remote lookups; rel (original) for local path.
+            local dir_rel = nrel:match("^(.+)/[^/]+$")
             if dir_rel then
                 local path_acc = ""
                 for part in dir_rel:gmatch("[^/]+") do
@@ -302,11 +304,11 @@ local function run_upload(server_url, username, password, local_folder, progress
             end
 
             local local_path = local_folder .. "/" .. rel
-            local remote_url = base_url .. "/" .. rel
+            local remote_url = base_url .. "/" .. nrel
             local ok, msg = webdav.upload_file(remote_url, local_path, username, password)
             if ok then
                 count_ok = count_ok + 1
-                table.insert(uploaded_rels, rel)
+                table.insert(uploaded_rels, nrel)
             else
                 count_fail = count_fail + 1
                 local filename = rel:match("([^/]+)$") or rel
@@ -455,7 +457,7 @@ local function build_remote_index(list, base, server_url)
                 if not href:match("^https?://") then
                     href = origin .. (href:gsub("^/*", "/"))
                 end
-                index[rel] = { href = href, etag = e.etag, mtime = e.mtime }
+                index[rel] = { href = href, etag = e.etag, mtime = e.mtime, size = e.size }
             end
         end
     end
@@ -529,23 +531,59 @@ local function diff_indices(remote_index, local_index, cache_files)
                 table.insert(to_download, { rel = rel, remote = remote })
             end
         elseif r_chg and l_chg then
-            logger.dbg(LOG .. "diff conflict (both changed): " .. rel
-                .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
-                .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
-                .. " loc_size=" .. tostring(loc and loc.size) .. " c_loc_size=" .. tostring(cached.local_size)
-                .. " loc_mtime=" .. tostring(loc and loc.mtime) .. " c_loc_mtime=" .. tostring(cached.local_mtime))
-            table.insert(conflicts, { rel = rel, remote = remote, local_file = loc })
+            -- Both sides changed. If sizes match, assume content is the same and reseed.
+            if loc and remote.size and loc.size and remote.size == loc.size then
+                logger.dbg(LOG .. "diff size-match (conflict, sizes equal, reseeding): " .. rel
+                    .. " size=" .. tostring(loc.size))
+                cache_files[rel] = {
+                    remote_etag  = remote.etag,
+                    remote_mtime = remote.mtime,
+                    local_mtime  = loc.mtime,
+                    local_size   = loc.size,
+                }
+            else
+                logger.dbg(LOG .. "diff conflict (both changed): " .. rel
+                    .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
+                    .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
+                    .. " loc_size=" .. tostring(loc and loc.size) .. " c_loc_size=" .. tostring(cached.local_size)
+                    .. " loc_mtime=" .. tostring(loc and loc.mtime) .. " c_loc_mtime=" .. tostring(cached.local_mtime))
+                table.insert(conflicts, { rel = rel, remote = remote, local_file = loc })
+            end
         elseif r_chg then
-            local dl_hex = rel:gsub(".", function(c) return string.format("%02x", c:byte()) end)
-            logger.dbg(LOG .. "diff download (remote changed): " .. rel
-                .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
-                .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
-                .. " local_in_index=" .. tostring(loc ~= nil)
-                .. "  HEX:" .. dl_hex)
-            table.insert(to_download, { rel = rel, remote = remote })
+            -- Remote changed. If local exists and sizes match, assume in sync; reseed.
+            if loc and remote.size and loc.size and remote.size == loc.size then
+                logger.dbg(LOG .. "diff size-match (remote changed, sizes equal, reseeding): " .. rel
+                    .. " size=" .. tostring(loc.size))
+                cache_files[rel] = {
+                    remote_etag  = remote.etag,
+                    remote_mtime = remote.mtime,
+                    local_mtime  = loc.mtime,
+                    local_size   = loc.size,
+                }
+            else
+                local dl_hex = rel:gsub(".", function(c) return string.format("%02x", c:byte()) end)
+                logger.dbg(LOG .. "diff download (remote changed): " .. rel
+                    .. " r_etag=" .. tostring(remote.etag) .. " c_r_etag=" .. tostring(cached.remote_etag)
+                    .. " r_mtime=" .. tostring(remote.mtime) .. " c_r_mtime=" .. tostring(cached.remote_mtime)
+                    .. " local_in_index=" .. tostring(loc ~= nil)
+                    .. "  HEX:" .. dl_hex)
+                table.insert(to_download, { rel = rel, remote = remote })
+            end
         elseif l_chg and loc then
-            logger.dbg(LOG .. "diff upload (local changed): " .. rel)
-            table.insert(to_upload, { rel = rel, local_file = loc })
+            -- Local changed. If remote size is known and matches, assume in sync; reseed.
+            if remote.size and loc.size and remote.size == loc.size then
+                logger.dbg(LOG .. "diff size-match (local changed, sizes equal, reseeding): " .. rel
+                    .. " size=" .. tostring(loc.size))
+                cache_files[rel] = {
+                    remote_etag  = remote.etag,
+                    remote_mtime = remote.mtime,
+                    local_mtime  = loc.mtime,
+                    local_size   = loc.size,
+                }
+            else
+                logger.dbg(LOG .. "diff upload (local changed): " .. rel)
+                table.insert(to_upload, { rel = rel, local_file = loc })
+            end
         else
             logger.dbg(LOG .. "diff skip (unchanged): " .. rel)
         end

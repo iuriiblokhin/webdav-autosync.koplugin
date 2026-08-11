@@ -78,11 +78,12 @@ local function parse_http_date(s)
 end
 
 --- Parse PROPFIND XML response. Returns list of
---- { href, href_raw, is_collection, path, etag, mtime }.
+--- { href, href_raw, is_collection, path, etag, mtime, size }.
 --- href     = decoded URL (for local-path comparisons)
 --- href_raw = wire-format (percent-encoded, safe to use directly as a request URL)
 --- etag     = ETag value with surrounding quotes stripped, or nil
 --- mtime    = UTC epoch seconds from getlastmodified, or nil
+--- size     = content length in bytes, or nil
 local function parse_propfind_response(body)
     local list = {}
     for block in (body or ""):gmatch("<[^:]*:response[^>]*>.-</[^:]*:response>") do
@@ -106,6 +107,9 @@ local function parse_propfind_response(body)
             local lastmod = block:match(
                 "<[^:]*:getlastmodified[^>]*>([^<]+)</[^:]*:getlastmodified>")
             local mtime = parse_http_date(lastmod)
+            local size_str = block:match(
+                "<[^:]*:getcontentlength[^>]*>([^<]+)</[^:]*:getcontentlength>")
+            local size = size_str and tonumber(size_str) or nil
             table.insert(list, {
                 href = href,
                 href_raw = href_raw,
@@ -113,6 +117,7 @@ local function parse_propfind_response(body)
                 path = path,
                 etag = etag,
                 mtime = mtime,
+                size = size,
             })
         end
     end

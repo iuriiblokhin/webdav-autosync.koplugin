@@ -11,7 +11,7 @@ local LOG = "[webdav-autosync] "
 
 --- File extensions KOReader supports (default when user leaves filter empty).
 local KOREADER_DEFAULT_EXTENSIONS = {
-    "epub", "pdf", "djvu", "xps", "cbt", "cbz", "cb7", "fb2", "pdb",
+    "epub", "pdf", "djvu", "xps", "cbt", "cbz", "cb7", "cbr", "fb2", "fb3", "pdb",
     "txt", "html", "htm", "rtf", "chm", "doc", "mobi", "zip", "md",
 }
 local KOREADER_DEFAULT_EXTENSIONS_SET = {}

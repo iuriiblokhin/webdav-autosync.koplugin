@@ -7,7 +7,7 @@ Sync books between a WebDAV server and your device. Supports one-way download, o
 - **WebDAV connection** – Server URL with optional username/password (Basic auth).
 - **Import from KOReader cloud** – Populate server URL and credentials automatically from KOReader's built-in cloud storage configuration (if already set up there).
 - **Download folder** – Opens KOReader's file explorer; navigate and long-press a folder to select it (no typing paths).
-- **File extensions (optional)** – Sync only specific extensions (e.g. `epub, pdf, txt`). Leave empty to sync all formats KOReader supports (EPUB, PDF, DjVu, XPS, CBT, CBZ, CB7, FB2, PDB, TXT, HTML, RTF, CHM, DOC, MOBI, ZIP, MD).
+- **File extensions (optional)** – Sync only specific extensions (e.g. `epub, pdf, txt`). Leave empty to sync all formats KOReader supports (EPUB, PDF, DjVu, XPS, CBT, CBZ, CB7, CBR, FB2, FB3, PDB, TXT, HTML, RTF, CHM, DOC, MOBI, ZIP, MD).
 - **Auto sync on startup** – When enabled, a one-way download sync runs once when KOReader starts.
 - **Sync now** – One-way download: pull all matching files from the server.
 - **Upload now** – One-way upload: push all local files in the download folder to the server. Skips files that already exist on the server.
@@ -32,7 +32,7 @@ Sync books between a WebDAV server and your device. Supports one-way download, o
    - Or tap **Import from KOReader cloud storage** to fill in URL and credentials from KOReader's existing cloud configuration.
 3. **Set credentials (optional)** – Username and password if the server requires auth.
 4. **Choose download folder** – Opens the file browser; navigate to a folder and long-press to select it.
-5. **Set file extensions (optional)** – Comma- or space-separated list. Leave empty to sync all KOReader-supported formats.
+5. **Set file extensions (optional)** – Comma- or space-separated list. Leave empty to sync all KOReader-supported formats (see list above).
 6. Choose a sync mode from the menu:
    - **Auto sync on startup** – Toggle automatic one-way download on KOReader start.
    - **Sync now** – Download all matching files from the server.
